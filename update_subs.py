@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+"""
+جمع‌آوری کانفیگ از لینک‌های subscription منبع، تست واقعی با xray-core،
+و ساخت فایل subscription از سرورهای سالم (مرتب‌شده بر اساس سرعت).
+"""
+import base64
+import json
+import os
+import queue
+import random
+import re
+import shutil
+import socket
+import subprocess
+import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import parse_qs, unquote, urlparse
+
+import requests
+
+XRAY = shutil.which("xray") or "./xray"
+TEST_URL = os.getenv("TEST_URL", "https://www.gstatic.com/generate_204")
+MAX_KEEP = int(os.getenv("MAX_KEEP", 100))     # حداکثر تعداد سرور در خروجی
+MAX_TEST = int(os.getenv("MAX_TEST", 1500))    # حداکثر تعداد سرور برای تست
+WORKERS = int(os.getenv("WORKERS", 20))        # تعداد تست همزمان
+TIMEOUT = int(os.getenv("TIMEOUT", 8))         # ثانیه
+BASE_PORT = 21000
+
+
+# ---------- ابزارهای کمکی ----------
+def b64d(s: str) -> str:
+    s = s.strip().replace("-", "+").replace("_", "/")
+    s += "=" * (-len(s) % 4)
+    return base64.b64decode(s).decode("utf-8", "ignore")
+
+
+def fetch(url: str):
+    try:
+        r = requests.get(url, timeout=30, headers={"User-Agent": "v2rayN/6.0"})
+        text = r.text.strip()
+        if "://" not in text[:60]:
+            text = b64d(text)
+        return re.findall(r'(?:vmess|vless|trojan|ss)://[^\s<>"\']+', text)
+    except Exception as e:
+        print(f"[!] خطا در دریافت {url}: {e}")
+        return []
+
+
+# ---------- تبدیل لینک به outbound ----------
+def stream_settings(q: dict, sec: str) -> dict:
+    net = q.get("type") or "tcp"
+    if net not in ("tcp", "ws", "grpc"):
+        raise ValueError(f"transport پشتیبانی نمی‌شود: {net}")
+    s = {"network": net, "security": sec if sec in ("tls", "reality") else "none"}
+    if sec == "tls":
+        tls = {"serverName": q.get("sni") or q.get("host") or "",
+               "fingerprint": q.get("fp") or "chrome"}
+        if q.get("alpn"):
+            tls["alpn"] = q["alpn"].split(",")
+        s["tlsSettings"] = tls
+    elif sec == "reality":
+        s["realitySettings"] = {
+            "serverName": q.get("sni", ""), "fingerprint": q.get("fp") or "chrome",
+            "publicKey": q.get("pbk", ""), "shortId": q.get("sid", ""),
+            "spiderX": q.get("spx", ""),
+        }
+    if net == "ws":
+        s["wsSettings"] = {"path": q.get("path", "/"),
+                           "headers": {"Host": q.get("host", "")}}
+    elif net == "grpc":
+        s["grpcSettings"] = {"serviceName": q.get("serviceName", "")}
+    elif net == "tcp" and q.get("headerType") == "http":
+        s["tcpSettings"] = {"header": {"type": "http", "request": {
+            "path": [q.get("path", "/")], "headers": {"Host": [q.get("host", "")]}}}}
+    return s
+
+
+def to_outbound(link: str) -> dict:
+    scheme = link.split("://")[0]
+
+    if scheme == "vmess":
+        d = json.loads(b64d(link[8:]))
+        q = {"type": d.get("net", "tcp"), "sni": d.get("sni") or d.get("host"),
+             "host": d.get("host"), "path": d.get("path"), "alpn": d.get("alpn"),
+             "fp": d.get("fp"), "serviceName": d.get("path"),
+             "headerType": d.get("type")}
+        q = {k: v for k, v in q.items() if v}
+        sec = "tls" if d.get("tls") == "tls" else "none"
+        return {"protocol": "vmess", "settings": {"vnext": [{
+            "address": d["add"], "port": int(d["port"]),
+            "users": [{"id": d["id"], "alterId": int(d.get("aid", 0) or 0),
+                       "security": d.get("scy", "auto")}]}]},
+            "streamSettings": stream_settings(q, sec)}
+
+    if scheme in ("vless", "trojan"):
+        u = urlparse(link)
+        q = {k: v[0] for k, v in parse_qs(u.query).items()}
+        if scheme == "vless":
+            sec = q.get("security", "none")
+            return {"protocol": "vless", "settings": {"vnext": [{
+                "address": u.hostname, "port": u.port,
+                "users": [{"id": u.username, "encryption": q.get("encryption", "none"),
+                           "flow": q.get("flow", "")}]}]},
+                "streamSettings": stream_settings(q, sec)}
+        sec = q.get("security", "tls")
+        return {"protocol": "trojan", "settings": {"servers": [{
+            "address": u.hostname, "port": u.port,
+            "password": unquote(u.username)}]},
+            "streamSettings": stream_settings(q, sec)}
+
+    if scheme == "ss":
+        body = link[5:].split("#")[0]
+        if "plugin=" in body:
+            raise ValueError("plugin پشتیبانی نمی‌شود")
+        body = body.split("?")[0].rstrip("/")
+        if "@" in body:
+            userinfo, hostport = body.rsplit("@", 1)
+            try:
+                method, pw = b64d(userinfo).split(":", 1)
+            except Exception:
+                method, pw = unquote(userinfo).split(":", 1)
+        else:
+            userinfo, hostport = b64d(body).rsplit("@", 1)
+            method, pw = userinfo.split(":", 1)
+        host, port = hostport.rsplit(":", 1)
+        return {"protocol": "shadowsocks", "settings": {"servers": [{
+            "address": host.strip("[]"), "port": int(port),
+            "method": method, "password": pw}]}}
+
+    raise ValueError("پروتکل ناشناخته")
+
+
+# ---------- تست ----------
+ports = queue.Queue()
+for i in range(WORKERS):
+    ports.put(BASE_PORT + i)
+
+
+def wait_port(port, timeout=4.0):
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            socket.create_connection(("127.0.0.1", port), 0.3).close()
+            return True
+        except OSError:
+            time.sleep(0.15)
+    return False
+
+
+def test(link: str):
+    try:
+        ob = to_outbound(link)
+    except Exception:
+        return None
+    port = ports.get()
+    cfg_path = None
+    proc = None
+    try:
+        cfg = {"log": {"loglevel": "none"},
+               "inbounds": [{"listen": "127.0.0.1", "port": port,
+                             "protocol": "socks", "settings": {"udp": False}}],
+               "outbounds": [ob]}
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump(cfg, f)
+            cfg_path = f.name
+        proc = subprocess.Popen([XRAY, "run", "-c", cfg_path],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if not wait_port(port):
+            return None
+        r = subprocess.run(
+            ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code} %{time_total}",
+             "-x", f"socks5h://127.0.0.1:{port}", "--max-time", str(TIMEOUT), TEST_URL],
+            capture_output=True, text=True)
+        code, t = r.stdout.split()
+        if code in ("204", "200"):
+            return link, int(float(t) * 1000)
+    except Exception:
+        pass
+    finally:
+        if proc:
+            proc.kill()
+            proc.wait()
+        if cfg_path and os.path.exists(cfg_path):
+            os.unlink(cfg_path)
+        ports.put(port)
+    return None
+
+
+def rename(link: str, name: str) -> str:
+    if link.startswith("vmess://"):
+        d = json.loads(b64d(link[8:]))
+        d["ps"] = name
+        return "vmess://" + base64.b64encode(json.dumps(d).encode()).decode()
+    return link.split("#")[0] + "#" + name
+
+
+# ---------- اجرا ----------
+def main():
+    with open("sources.txt", encoding="utf-8") as f:
+        sources = [l.strip() for l in f if l.strip() and not l.startswith("#")]
+
+    links = {}
+    for url in sources:
+        found = fetch(url)
+        print(f"[+] {len(found)} کانفیگ از {url}")
+        for l in found:
+            links.setdefault(l.split("#")[0], l)
+    links = list(links.values())
+    random.shuffle(links)
+    links = links[:MAX_TEST]
+    print(f"[*] تست {len(links)} کانفیگ یکتا ...")
+
+    with ThreadPoolExecutor(WORKERS) as ex:
+        results = [r for r in ex.map(test, links) if r]
+    results.sort(key=lambda x: x[1])
+    results = results[:MAX_KEEP]
+    print(f"[✓] {len(results)} سرور سالم")
+
+    if not results:
+        print("[!] هیچ سرور سالمی پیدا نشد؛ فایل قبلی دست‌نخورده ماند.")
+        return
+
+    out = [rename(l, f"{i+1:03d}-{ms}ms") for i, (l, ms) in enumerate(results)]
+    with open("sub_raw.txt", "w", encoding="utf-8") as f:
+        f.write("\n".join(out))
+    with open("sub.txt", "w", encoding="utf-8") as f:
+        f.write(base64.b64encode("\n".join(out).encode()).decode())
+
+
+if __name__ == "__main__":
+    main()
