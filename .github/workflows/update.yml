@@ -8,6 +8,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: update-subs
+  cancel-in-progress: false
+
 jobs:
   update:
     runs-on: ubuntu-latest
@@ -34,4 +38,12 @@ jobs:
           git config user.name "github-actions"
           git config user.email "actions@github.com"
           git add sub.txt sub_raw.txt
-          git diff --cached --quiet || (git commit -m "update subscription" && git push)
+          if git diff --cached --quiet; then
+            echo "no changes"; exit 0
+          fi
+          git commit -m "update subscription"
+          for i in 1 2 3; do
+            git pull --rebase -X theirs origin main && git push && exit 0
+            sleep 5
+          done
+          exit 1
