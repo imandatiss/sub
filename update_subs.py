@@ -23,10 +23,13 @@ import requests
 XRAY = shutil.which("xray") or "./xray"
 TEST_URL = os.getenv("TEST_URL", "https://www.gstatic.com/generate_204")
 MAX_KEEP = int(os.getenv("MAX_KEEP", 60))     # حداکثر تعداد سرور در خروجی
-MAX_TEST = int(os.getenv("MAX_TEST", 1500))    # حداکثر تعداد سرور برای تست
-WORKERS = int(os.getenv("WORKERS", 20))        # تعداد تست همزمان
+MAX_TEST = int(os.getenv("MAX_TEST", 2500))    # حداکثر تعداد سرور برای تست
+WORKERS = int(os.getenv("WORKERS", 30))        # تعداد تست همزمان
 TIMEOUT = int(os.getenv("TIMEOUT", 8))         # ثانیه
 BASE_PORT = 21000
+MAX_TCP = int(os.getenv("MAX_TCP", 25000))          # حداکثر کانفیگ برای فیلتر سریع TCP
+PER_ENDPOINT = int(os.getenv("PER_ENDPOINT", 2))    # حداکثر کانفیگ تکراری برای یک آی‌پی:پورت
+REQUIRE_TLS = os.getenv("REQUIRE_TLS", "1") == "1"  # حذف vmess/vless/trojan بدون TLS
 SPEED_URL = os.getenv("SPEED_URL", "https://speed.cloudflare.com/__down?bytes=5000000")
 SPEED_TIME = int(os.getenv("SPEED_TIME", 10))      # حداکثر ثانیه دانلود برای هر سرور
 DEEP_N = int(os.getenv("DEEP_N", 300))             # چند سرور سریع‌تر وارد تست سرعت شوند
@@ -226,6 +229,31 @@ def deep(item):
         return None
 
 
+def prefilter(link: str):
+    """(host, port) برمی‌گرداند؛ کانفیگ نامناسب (بدون TLS، ناقص) را None می‌کند."""
+    try:
+        ob = to_outbound(link)
+    except Exception:
+        return None
+    st = ob.get("streamSettings", {})
+    if REQUIRE_TLS and ob["protocol"] in ("vmess", "vless", "trojan") \
+            and st.get("security", "none") == "none":
+        return None
+    node = (ob["settings"].get("vnext") or ob["settings"].get("servers"))[0]
+    return node["address"], int(node["port"])
+
+
+def tcp_ok(link: str):
+    ep = prefilter(link)
+    if not ep:
+        return None
+    try:
+        socket.create_connection(ep, 3).close()
+        return link, ep
+    except OSError:
+        return None
+
+
 def rename(link: str, name: str) -> str:
     if link.startswith("vmess://"):
         d = json.loads(b64d(link[8:]))
@@ -246,9 +274,21 @@ def main():
         for l in found:
             links.setdefault(l.split("#")[0], l)
     links = list(links.values())
+    print(f"[*] مجموع کانفیگ یکتا: {len(links)}")
     random.shuffle(links)
-    links = links[:MAX_TEST]
-    print(f"[*] تست {len(links)} کانفیگ یکتا ...")
+    links = links[:MAX_TCP]
+
+    # فیلتر سریع: پورت باز باشد + حداکثر چند کانفیگ برای هر آی‌پی:پورت
+    with ThreadPoolExecutor(300) as ex:
+        tcp_alive = [r for r in ex.map(tcp_ok, links) if r]
+    per_ep, picked = {}, []
+    for l, ep in tcp_alive:
+        if per_ep.get(ep, 0) < PER_ENDPOINT:
+            per_ep[ep] = per_ep.get(ep, 0) + 1
+            picked.append(l)
+    print(f"[✓] پورت باز: {len(tcp_alive)} | بعد از حذف تکراری: {len(picked)}")
+    links = picked[:MAX_TEST]
+    print(f"[*] تست واقعی {len(links)} کانفیگ ...")
 
     with ThreadPoolExecutor(WORKERS) as ex:
         alive = [r for r in ex.map(quick, links) if r]
