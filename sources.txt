@@ -1,0 +1,4 @@
+# هر خط یک لینک subscription منبع (لینک‌های خودت یا منابع عمومی مورد اعتمادت)
+# خط‌هایی که با # شروع شوند نادیده گرفته می‌شوند
+# https://example.com/my-subscription
+# https://raw.githubusercontent.com/USER/REPO/main/sub.txt
