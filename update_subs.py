@@ -15,17 +15,23 @@ import subprocess
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from urllib.parse import parse_qs, unquote, urlparse
 
 import requests
 
 XRAY = shutil.which("xray") or "./xray"
 TEST_URL = os.getenv("TEST_URL", "https://www.gstatic.com/generate_204")
-MAX_KEEP = int(os.getenv("MAX_KEEP", 100))     # حداکثر تعداد سرور در خروجی
+MAX_KEEP = int(os.getenv("MAX_KEEP", 60))     # حداکثر تعداد سرور در خروجی
 MAX_TEST = int(os.getenv("MAX_TEST", 1500))    # حداکثر تعداد سرور برای تست
 WORKERS = int(os.getenv("WORKERS", 20))        # تعداد تست همزمان
 TIMEOUT = int(os.getenv("TIMEOUT", 8))         # ثانیه
 BASE_PORT = 21000
+SPEED_URL = os.getenv("SPEED_URL", "https://speed.cloudflare.com/__down?bytes=5000000")
+SPEED_TIME = int(os.getenv("SPEED_TIME", 10))      # حداکثر ثانیه دانلود برای هر سرور
+DEEP_N = int(os.getenv("DEEP_N", 300))             # چند سرور سریع‌تر وارد تست سرعت شوند
+DEEP_WORKERS = int(os.getenv("DEEP_WORKERS", 5))   # تست سرعت همزمان (کم، تا پهنای باند تقسیم نشود)
+MIN_KBPS = int(os.getenv("MIN_KBPS", 500))         # حداقل سرعت قابل قبول (کیلوبایت بر ثانیه)
 
 
 # ---------- ابزارهای کمکی ----------
@@ -148,11 +154,10 @@ def wait_port(port, timeout=4.0):
     return False
 
 
-def test(link: str):
-    try:
-        ob = to_outbound(link)
-    except Exception:
-        return None
+@contextmanager
+def proxy_for(link: str):
+    """xray را برای این لینک بالا می‌آورد و پورت socks را می‌دهد (یا None)."""
+    ob = to_outbound(link)
     port = ports.get()
     cfg_path = None
     proc = None
@@ -166,17 +171,7 @@ def test(link: str):
             cfg_path = f.name
         proc = subprocess.Popen([XRAY, "run", "-c", cfg_path],
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if not wait_port(port):
-            return None
-        r = subprocess.run(
-            ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code} %{time_total}",
-             "-x", f"socks5h://127.0.0.1:{port}", "--max-time", str(TIMEOUT), TEST_URL],
-            capture_output=True, text=True)
-        code, t = r.stdout.split()
-        if code in ("204", "200"):
-            return link, int(float(t) * 1000)
-    except Exception:
-        pass
+        yield port if wait_port(port) else None
     finally:
         if proc:
             proc.kill()
@@ -184,7 +179,51 @@ def test(link: str):
         if cfg_path and os.path.exists(cfg_path):
             os.unlink(cfg_path)
         ports.put(port)
+
+
+def curl(port, url, max_time):
+    r = subprocess.run(
+        ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code} %{time_total} %{speed_download}",
+         "-x", f"socks5h://127.0.0.1:{port}", "--max-time", str(max_time), url],
+        capture_output=True, text=True)
+    parts = r.stdout.split()
+    if len(parts) != 3:
+        return None
+    return parts[0], float(parts[1]), float(parts[2])
+
+
+def quick(link: str):
+    """مرحله ۱: فقط وصل می‌شود یا نه."""
+    try:
+        with proxy_for(link) as port:
+            if port:
+                r = curl(port, TEST_URL, TIMEOUT)
+                if r and r[0] in ("204", "200"):
+                    return link, int(r[1] * 1000)
+    except Exception:
+        pass
     return None
+
+
+def deep(item):
+    """مرحله ۲: پایداری (۳ پینگ پشت‌سرهم) و سرعت دانلود."""
+    link = item[0]
+    try:
+        with proxy_for(link) as port:
+            if not port:
+                return None
+            lat = []
+            for _ in range(3):
+                r = curl(port, TEST_URL, 5)
+                if not r or r[0] not in ("204", "200"):
+                    return None
+                lat.append(r[1] * 1000)
+            r = curl(port, SPEED_URL, SPEED_TIME)
+            if not r or r[0] != "200":
+                return None
+            return link, int(sum(lat) / 3), int(max(lat) - min(lat)), r[2] / 1024
+    except Exception:
+        return None
 
 
 def rename(link: str, name: str) -> str:
@@ -212,16 +251,31 @@ def main():
     print(f"[*] تست {len(links)} کانفیگ یکتا ...")
 
     with ThreadPoolExecutor(WORKERS) as ex:
-        results = [r for r in ex.map(test, links) if r]
-    results.sort(key=lambda x: x[1])
-    results = results[:MAX_KEEP]
-    print(f"[✓] {len(results)} سرور سالم")
+        alive = [r for r in ex.map(quick, links) if r]
+    alive.sort(key=lambda x: x[1])
+    print(f"[✓] مرحله ۱: {len(alive)} سرور وصل می‌شود")
 
-    if not results:
+    candidates = alive[:DEEP_N]
+    print(f"[*] مرحله ۲: تست سرعت و پایداری {len(candidates)} سرور ...")
+    with ThreadPoolExecutor(DEEP_WORKERS) as ex:
+        deep_res = [r for r in ex.map(deep, candidates) if r]
+    deep_res.sort(key=lambda x: x[3], reverse=True)   # بر اساس سرعت
+
+    good = [r for r in deep_res if r[3] >= MIN_KBPS]
+    if not good and deep_res:
+        print("[!] هیچ سروری به حداقل سرعت نرسید؛ بهترین‌های موجود نگه داشته شد.")
+        good = deep_res[:20]
+    good = good[:MAX_KEEP]
+    print(f"[✓] {len(good)} سرور سریع و پایدار")
+
+    if not good:
         print("[!] هیچ سرور سالمی پیدا نشد؛ فایل قبلی دست‌نخورده ماند.")
         return
 
-    out = [rename(l, f"{i+1:03d}-{ms}ms") for i, (l, ms) in enumerate(results)]
+    out = []
+    for i, (l, ms, jitter, kbps) in enumerate(good):
+        mbps = kbps * 8 / 1024
+        out.append(rename(l, f"{i+1:03d}-{mbps:.1f}Mbps-{ms}ms"))
     with open("sub_raw.txt", "w", encoding="utf-8") as f:
         f.write("\n".join(out))
     with open("sub.txt", "w", encoding="utf-8") as f:
